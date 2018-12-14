@@ -29,13 +29,18 @@ import signal
 #%qtconsole
 
 
+from Pulse import *
+import logging
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())    # if this logger is muted
+from Toolkit import Tk_file
+
+
 # based on Maxwell-Bloch equations like in doi:10.1126/sciadv.1701626
 # optimal control approach in doi:10.1007/s11664-014-3228-9
 # todo:
 """
 Questions:
-- what kind of pi pulse is this?
-  -> dependent on initial state?
 - what does init_steady()?
 - cavity field a looks weird during rectangular pulse (no!)
 - no nice Rabi possible for high power and low Q cavity?
@@ -44,33 +49,33 @@ Questions:
   (vs Nöbauer paper: polarize N)
 - why is the fundamental Fourier frequency of OC pulse the Rabi frequency?
   + its harmonics?
-- how can this work if the optimization step is in a random direction?
-- what's the role of temperature?
 """
 
+# todo:
+# write save method with params
 
 class InputParams:
     def __init__(self):
         # collective coupling
-        self.gcoll = 10.7*np.pi #HWHM
+        self.gcoll = 1  #10.7*np.pi #HWHM
         # cavity quality factor
         self.quali = 250#949
         # cavity f_res
         self.fr = 3.4892e3
         # cavity bandwidth
-        self.kappa = np.pi*self.fr/self.quali #HWHM
-        # detuning cavity to spin central frequency ws-wc
+        self.kappa = None #HWHM
+        # detuning cavity to spin central frequency ws-wc, unused!
         self.delta = 0* 2*np.pi
         # detuning drive to cavity wc-wp
         self.deltac = 0* 2*np.pi
         # transverse spin relaxation rate
-        self.gperp = 2*np.pi*0.09 #HWHM
+        self.gperp = 1e-9*  2*np.pi*0.09 #HWHM
         # longitudinal spin relaxation rate
-        self.gpar = 2*np.pi*.001#0.001 #HWHM
+        self.gpar = 1e-9*   2*np.pi*.001#0.001 #HWHM
         # q of spin pdf, q-Gaussian (see tsallis)
         self.q = 1.39
         # width of spin pdf, q-Gaussian
-        self.gammaq = 2*np.pi*9.4 #FWHM
+        self.gammaq = 1e-9* 2*np.pi*9.4 #FWHM
         # bins in spin pdf
         self.nbins = 701#701#5000#20
         #g0 = self.gcoll/sqrt(nspins)
@@ -78,7 +83,7 @@ class InputParams:
         self.pumptime = 200e-3      # us
         self.decaytime = 300e-3
         self.dt = 0.5e-3
-        self.numsteps = int(self.pumptime/self.dt)
+        self.numsteps = None
 
         self.holes = False
         self.sim_inhom = True
@@ -89,11 +94,62 @@ class InputParams:
         self.gs = None
         self.pdf = None
 
+    def init(self):
+        # stuff that is calculated from input params
+        self.kappa = np.pi * self.fr / self.quali  # HWHM
+        self.numsteps = int(self.pumptime / self.dt)
+
+        init_spin_pdf()
+
+        logger.info("Saving input params for new init.")
+        filename = 'mbeSim_params.json'
+        filename = Tk_file._addTimestamp(filename)
+        Tk_file.saveToFile(self, path_out + '\\' + filename, 'json')
+        # plot_spin_pdf(param)
+
+
+def init_output_dir():
+    import os
+    from datetime import datetime
+    date = datetime.now().strftime("%Y%m%d")
+    path_out = os.getcwd() + '\\output\\' + str(date)
+    if not os.path.exists(path_out):
+        os.makedirs(path_out)
+
+    return path_out
 
 def init():
-    init_spin_pdf()
-    init_steady()
-    init_power()
+    init_logging()
+    param.init()
+
+    pass
+    # only for calibration, doesn't init sim params
+    #init_steady()
+    #init_power()
+
+def init_logging():
+    # Here! -> All messages from inits done during 'import' not shown
+    logger = logging.getLogger()  # get root logger
+    # add new handler with own format
+    consoleHandler = logging.StreamHandler()
+    logger.setLevel(logging.DEBUG)  # to avoid debug from pistage to root logger
+    format_1 = logging.Formatter("[%(levelname)7s] - [%(asctime)s] - %(message)s  (%(filename)s::%(funcName)s)",
+                                 "%Y-%m-%d %H:%M:%S")
+    format_2 = logging.Formatter("[%(levelname)7s] - %(message)s ", "%Y-%m-%d %H:%M:%S")
+    consoleHandler.setFormatter(format_2)
+    logger.addHandler(consoleHandler)
+
+    loggersStr = [str(loggers) for loggers in logging.Logger.manager.loggerDict]
+    logging.debug("Root logger set active.")
+
+    # deactivate all loggers:
+    for loggerStr in logging.Logger.manager.loggerDict:
+        logger = logging.getLogger(loggerStr)
+        logger.propagate = False
+
+    # activate logger of this file
+    logger = logging.getLogger(__name__)
+    logger.propagate = True
 
 def odeintz(func, z0, t, **kwargs):
     """An odeint-like function for complex valued differential equations."""
@@ -181,13 +237,20 @@ def init_spin_pdf():
         param.pdf[int(param.nbins/2)] = 1
 
     param.spins = f #draw samples according to distribution
-    param.gs = np.sqrt(param.pdf)*param.gcoll
-    plt.plot(f, param.pdf)
+    param.gs = np.sqrt(param.pdf)*param.gcoll       # single g
+
+    logger.info("Setting spin couplings for pdf. g_coll: {:.2f} MHz, Max. g_single: {:.2f} MHz".format(param.gcoll, np.max(param.gs)))
+
+
+def plot_spin_pdf(param_in):
+
+    f = np.linspace(-param_in.gammaq / 2, param_in.gammaq / 2, param_in.nbins)
+
+    plt.plot(f, param_in.pdf)
 
     plt.xlabel('f (MHz)')   # todo: really freq or w units?
     plt.ylabel(r'$p$')
     plt.title(r'Spin pdf (Q-Gaussian)')
-
 
 
 def func(a, eta, deltdrive):
@@ -358,32 +421,165 @@ def pulse_rwa(t, args):
         pulse = pulse+(fcomps[i])*np.sin((i+1)*wgrund*t)
     return pulse
 
+def p_dbm_to_wrabi(p_in):
+    aref = 2 * np.pi * 50       # rabi freq per sqrt(dBm) amplitude
+    a_in = aref*10**(p_in/20.)  # power calibration: dB -> Rabi freq    [todo: f or w units?]
 
-def plot_rabi(p_in):
-    # to validate pumptime
-    # vary pumptime and look at sig_z. should see rabis.
+    return a_in
 
-    aref = 2 * np.pi * 50  # rabi freq per sqrt(dBm) amplitude
-    a_in = aref*10**(p_in/20.) # power calibration: dB -> Rabi freq
-    t_pulse_list = np.linspace(10*1e-3, param.pumptime*2, 100)
+def p_wrabi_to_dbm(w_rabi):
+    aref = 2 * np.pi * 50       # rabi freq per sqrt(dBm) amplitude
+    p = 20 * np.log10(w_rabi/aref)
+
+    return p
+
+def p_db_to_factor(p_db):
+    return 10**(p_db/20.)
+
+def calc_pulse_rect(t_pump, p_in):
+    """
+    Calc s_z after rectangular pulse
+    :param t_pump:
+    :param p_in:
+    :return:
+    """
+    a_in = p_dbm_to_wrabi(p_in)
 
     init = np.ones(param.nbins*2+1)*(-1)
     init[0] = 0
     init[1::2] = 0
 
     tlist_decay = np.arange(0, 1, 1)  # dummy decay
+
+    # todo: calcing for whole tlist is probably super inefficient
+    tlist = np.arange(0, t_pump + param.dt, param.dt)  # discrete time for ode
+    asolpump, asoldecay, infodict = do_calculation(a_in, tlist, tlist_decay, init)
+
+    return np.real(np.sum(asolpump[:, 2::2], axis=1))[-1]       # final s_z
+
+
+def plot_rabi(p_in, t_start_us, t_end_us, n_t=100):
+    # to validate pumptime
+    # vary pumptime and look at sig_z. should see rabis.
+
+    t_pulse_list = np.linspace(t_start_us, t_end_us, n_t)
     sz_final = []
 
     for i, t in enumerate(t_pulse_list):
-        tlist = np.arange(0, t + param.dt, param.dt)  # discrete time for ode
-        asolpump, asoldecay, infodict = do_calculation(a_in, tlist, tlist_decay, init)
-        sz_final.append((np.real(np.sum(asolpump[:, 2::2], axis=1)))[-1])
+        sz_final.append(calc_pulse_rect(t, p_in))
 
     plt.figure()
     plt.xlabel('Pulse time (ns) @ P={} dB'.format(p_in))
     plt.ylabel(r'$\sigma_z$')
     plt.plot(1000*t_pulse_list, sz_final)
 
+def plot_rabi_2d_t_q(p_in, t_start_us, t_end_us, q_start, q_end, n_t=100, n_q=15):
+    # to validate pumptime
+    # vary pumptime and look at sig_z. should see rabis.
+
+    t_pulse_list = np.linspace(t_start_us, t_end_us, n_t)
+    q_list = np.linspace(q_start, q_end, n_q)
+
+    sz_final = np.zeros([n_t, n_q])
+
+    for j, q in enumerate(q_list):
+        param.quali = q
+        param.init()
+        for i, t in enumerate(t_pulse_list):
+            sz_final[i,j] = calc_pulse_rect(t, p_in)
+
+    plt.figure()
+    plt.xlabel('Pulse time (ns) @ P={} dB'.format(p_in))
+    plt.ylabel(r'$Q$')
+    plt.pcolor(1000*t_pulse_list, q_list, np.transpose(sz_final))#, vmin=-1, vmax=1)
+    plt.colorbar()
+
+
+def plot_rabi_2d_t_a(t_start_us, t_end_us, a_start, a_end, q=250, n_t=100, n_a=15):
+    # to validate pumptime
+    # vary pumptime and look at sig_z. should see rabis.
+
+    t_pulse_list = np.linspace(t_start_us, t_end_us, n_t)
+    a_list = np.linspace(a_start, a_end, n_a)
+    param.quali = q
+    param.init()
+    sz_final = np.zeros([n_t, n_a])
+
+    for j, a in enumerate(a_list):
+        for i, t in enumerate(t_pulse_list):
+            p_in = p_wrabi_to_dbm(a)
+            sz_final[i,j] = calc_pulse_rect(t, p_in)
+
+    plt.figure()
+    plt.xlabel('Pulse time (ns) @ Q={} dB'.format(q))
+    plt.ylabel(r'$a$')
+    plt.pcolor(1000*t_pulse_list, a_list, np.transpose(sz_final))#, vmin=-1, vmax=1)
+    plt.colorbar()
+
+
+def plot_pulse_t_g(pulse, g_coll_start, gcoll_end, n_q=15):
+    # to validate pumptime
+    # vary pumptime and look at sig_z. should see rabis.
+
+    t_list = pulse.t
+    g_list = np.linspace(g_coll_start, gcoll_end, n_q)
+
+
+    alos = np.zeros((len(g_list), len(t_list)))
+    szlos = np.zeros(np.shape(alos))
+
+    init = np.ones(param.nbins * 2 + 1) * (-1)
+    init[0] = 0
+    init[1::2] = 0
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+
+    for j, gcoll in enumerate(g_list):
+        param.gcoll = gcoll
+        param.init()
+
+        pulse_i = pulse.to_iq()[0]
+        pulse_q = pulse.to_iq()[1]
+
+        asolpump, infodict = do_calculation_soc_pump_only(pulse_i, pulse_q, pulse.t, init)
+        alos[j, :] = (abs(asolpump[:, 0])) ** 2
+        szlos[j, :] = np.real(np.sum(asolpump[:, 2::2], axis=1))
+
+        leave_out_factor = np.ceil(len(g_list) / 10.0)
+        if j % leave_out_factor != 0:
+            continue
+        ax1.plot(1000 * t_list, alos[j, :], label=r'$g_c$={:.2f}, $g_s$={:.2f} MHz'.format(gcoll, np.max(param.gs)))
+        ax2.plot(1000 * t_list, szlos[j, :], label=r'$g_c$={:.2f}, $g_s$={:.2f} MHz'.format(gcoll, np.max(param.gs)))
+
+
+    # cav field
+    ax1.set_xlabel('Time (ns)')
+    ax1.set_title(r'Cavity field $a$')
+    ax1.set_ylabel(r'$a$')
+    ax1.legend()
+
+    # spins
+    ax2.set_xlabel('Time (ns)')
+    ax2.set_title(r'Spin population $\sigma_z$')
+    ax2.set_ylabel('$\sigma_z$')
+    ax2.legend()
+
+
+    """
+    # cavity field amplitude a
+    im1 = ax1.pcolor(t_list, g_list, alos, norm=colors.LogNorm())
+    ax1.set_xlabel('Time (ns)')
+    ax1.set_ylabel('Coll couping (Mhz)')
+    ax1.set_title(r'Cavity field $a$')
+    # cbaxes = fig.add_axes([0.0, 0.1, 0.03, 0.8])
+    # fig.colorbar(im1)
+
+    # ensemble spin population sig_z
+    im2 = ax2.pcolor(t_list, g_list, szlos)
+    ax2.set_xlabel('Time (ns)')
+    ax2.set_ylabel('Coll couping (Mhz)')
+    ax2.set_title(r'Spin population $\sigma_z$')
+    """
 
 def init_power():
     # Calibrate power
@@ -403,13 +599,12 @@ def init_power():
 
     # input power
     pin = np.arange(-45, 0,1)
-    aref = 2*np.pi*50  # rabi freq per sqrt(dBm) amplitude
 
     alos = np.zeros((len(pin), len(tlist)+len(tlistdecay)))
     szlos = np.zeros(np.shape(alos))
 
     for ctr, p in enumerate(pin):
-        dr = aref*10**(p/20.) # power calibration: dB -> Rabi freq
+        dr = p_dbm_to_wrabi(p)
         asolpump, asoldecay, infodict = do_calculation(dr, tlist, tlistdecay, init)
         alos[ctr, : ] = np.hstack((abs(asolpump[:,0])**2, abs(asoldecay[:,0])**2))
         szlos[ctr, :] = np.hstack((np.real(np.sum(asolpump[:, 2::2], axis=1)), np.real(np.sum(asoldecay[:, 2::2], axis=1))))
@@ -421,16 +616,20 @@ def init_power():
     fig, (ax1, ax2) = plt.subplots(1,2, figsize=(15,5))
 
     # cavity field amplitude a
-    ax1.pcolor(tplot, pin, alos, norm=colors.LogNorm())
+    im1 = ax1.pcolor(tplot, pin, alos, norm=colors.LogNorm())
     ax1.set_xlabel('Time (ns)')
     ax1.set_ylabel('Input power (dB)')
     ax1.set_title(r'Cavity field $a$')
+    #cbaxes = fig.add_axes([0.0, 0.1, 0.03, 0.8])
+    #fig.colorbar(im1)
 
     # ensemble spin population sig_z
-    ax2.pcolor(tplot, pin, szlos)
+    im2 = ax2.pcolor(tplot, pin, szlos)
     ax2.set_xlabel('Time (ns)')
     ax2.set_ylabel('Input power (dB)')
     ax2.set_title(r'Spin population $\sigma_z$')
+
+    #fig.colorbar(im2)
 
     # sig_z, cut through power at end of pumptime (?)
     fig, ax3 = plt.subplots(1, 1)
@@ -451,16 +650,82 @@ def init_power():
     ax4.set_ylabel(r'$a$')
     ax4.set_title(r'Cavity field $a$')
 
-def calculate_fitness(fcomps, timelist=[], wgrund=1):
-    fcomps_i = fcomps[:,0]
-    fcomps_q = fcomps[:,1]
-    pulse_i = pulse_rwa(timelist, [wgrund, fcomps_i])
-    pulse_q = pulse_rwa(timelist, [wgrund, fcomps_q])
+
+def init_power_arb_pulse(pulse):
+    # Calibrate power for compensated pulse
+
+    pumptime = pulse.t[-1]
+    dt = pulse.dt
+    tlist = pulse.t
+
+    # test time it takes to calculate
+    init = np.ones(param.nbins * 2 + 1) * (-1)
+    init[0] = 0
+    init[1::2] = 0
+
+    # input power in dB amplification from rabi frequencies
+    pin = np.arange(0, 40, 2)
+
+    alos = np.zeros((len(pin), len(tlist)))
+    szlos = np.zeros(np.shape(alos))
+
+    for ctr, p in enumerate(pin):
+        kappa = p_db_to_factor(p)
+        pulse_i = pulse.to_iq()[0] * kappa
+        pulse_q = pulse.to_iq()[1] * kappa
+
+        asolpump, infodict = do_calculation_soc_pump_only(pulse_i, pulse_q, pulse.t, init)
+        alos[ctr, :] = (abs(asolpump[:, 0])) ** 2
+        szlos[ctr, :] = np.real(np.sum(asolpump[:, 2::2], axis=1))
+
+    # some plots, probably relevant for power calibration
+
+    tplot = np.linspace(0, 1000 * (pumptime), len(tlist))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+
+    # cavity field amplitude a
+    ax1.pcolor(tplot, pin, alos, norm=colors.LogNorm())
+    ax1.set_xlabel('Time (ns)')
+    ax1.set_ylabel('Input power amplification(dB)')
+    ax1.set_title(r'Cavity field $a$')
+
+    # ensemble spin population sig_z
+    ax2.pcolor(tplot, pin, szlos)
+    ax2.set_xlabel('Time (ns)')
+    ax2.set_ylabel('Input power amplification (dB)')
+    ax2.set_title(r'Spin population $\sigma_z$')
+
+    # sig_z, cut through power at end of pumptime (?)
+    fig, ax3 = plt.subplots(1, 1)
+    idx = min(range(len(tplot)), key=lambda i: abs(tplot[i] - pumptime * 1000))
+    plt.plot(pin, szlos[:, idx])
+    ax3.set_xlabel('Power amplification(dB)')
+    ax3.set_ylabel(r'$\sigma_z$')
+    ax3.set_title(r'Spin population after $t_{pump}$')
+
+    # a, cut through times
+    fig, ax4 = plt.subplots(1, 1)
+    leave_out_factor = np.ceil(len(pin) / 10.0)
+    for idx, p in enumerate(pin):
+        if idx % leave_out_factor != 0:
+            continue
+        ax4.plot(tplot, alos[idx, :], label='P={}'.format(str(p)))
+    ax4.legend()
+    ax4.set_xlabel('Time (ns)')
+    ax4.set_ylabel(r'$a$')
+    ax4.set_title(r'Cavity field $a$')
+
+
+def calculate_fitness(amp_t_i, amp_t_q, t_list=[]):
+
+    pulse_i = amp_t_i
+    pulse_q = amp_t_q
     init = np.ones(param.nbins*2+1)*(-1)
     init[0] = 0
     init[1::2] = 0
     # probably solve
-    solution, infodict = do_calculation_soc_pump_only(pulse_i, pulse_q, timelist, init)
+    solution, infodict = do_calculation_soc_pump_only(pulse_i, pulse_q, t_list, init)
     
     #plt.plot(timelist, pulse_i)
     #plt.show()
@@ -505,7 +770,7 @@ class SimulatedAnnealing:
                 ax.plot(t, y)
         plt.pause(0.05)
 
-    def main(self):
+    def main_old(self):
         import time
         
         populationPulse = np.zeros((param.numsteps, 2))
@@ -525,8 +790,11 @@ class SimulatedAnnealing:
         #for f in range(5):
         #    self.plot_pulse_interactive(ax, self.tp, np.random.random(size=len(self.tp)))
         #    time.sleep(1)
-        
-        while self.temp>0:
+        energy_best = 1
+        pulse_fcomps_best = None
+
+
+        while self.temp > 0:
             for i in range(self.number_tries):
                 
                 newfcomps = populationFourier + self.stepsize*np.random.uniform(-1, 1, (self.number_fcp, 2))
@@ -537,13 +805,21 @@ class SimulatedAnnealing:
                 if energynew < energy:
                     populationFourier = newfcomps
                     energy = energynew
+                    if energy < energy_best:
+                        energy_best = energy
+                        pulse_fcomps_best = populationFourier
+                        print('New best pulse, inversion %f. fcomps %s ' % (-energy_best, pulse_fcomps_best))
                 else:
                     # todo: this is weird. use energynew even if not lower?
+                    # accept pulse with certain probabilty, even if not better
+                    # see scipy.optimize.basinhopping
                     prop = min(1, np.exp(-(energynew-energy)/self.temp))
                     if np.random.uniform() < prop:
                         populationFourier = newfcomps
                         energy = energynew
-                print("Temp: %.3f, Inversion: %f, Step: %d"%(self.temp, -energy, i))
+
+                accepted = (energy == energynew)
+                print("Temp: %.3f, Inversion: %f, Step: %d, accepted: %s"%(self.temp, -energy, i, accepted))
                 
                 # construct pulse in t domain
                 pulse_i, pulse_q = pulse_t_from_f(populationFourier, self.tp, self.wgrund)
@@ -552,15 +828,164 @@ class SimulatedAnnealing:
 
             self.temp *= self.dT
         return populationFourier
-        
 
+    def main_play(self):
+
+        # matlab optimized (compensated pulse)
+        path = "input\\"
+        file = '180612_compensated_pi_200ns_downsampled400.mat'
+        pulse_raw = scipy.io.loadmat(path + '\\' + file)
+        t = pulse_raw['t_comp_in']
+        y_complex = pulse_raw['y_comp_in']
+
+        w_rabi = np.pi / t[0][-1]
+        kappa_p = 500 # factor vacuum Rabi freq -> cavity Rabi freq
+
+        # create comp pulse
+        pulse_comp = AmpPhasePulse()
+        pulse_comp.set_t_axis(t[0, :])
+        pulse_comp.amps_c = y_complex[0, :]
+        # convert to rabi freq in w units
+        pulse_comp.amps_c = 2*np.pi*  np.real(pulse_comp.amps_c) + np.imag(pulse_comp.amps_c)
+        pulse_comp.amps_c *= kappa_p
+
+
+        # create rect pulse
+        pulse_rect = AmpPhasePulse()
+        pulse_rect.set_t_axis(t[0, :])
+
+        pulse_rect.amps_c = np.ones(len(pulse_rect.t)) * w_rabi
+        pulse_rect.amps_c *= kappa_p
+
+        # show 2d plots: power a, s_z vs (amplification, time)
+        #init_power_arb_pulse(pulse_comp)
+        #init_power_arb_pulse(pulse_rect)
+        #sz_comp = calculate_fitness(pulse_comp.to_iq()[0], pulse_comp.to_iq()[1], pulse_comp.t)
+        #sz_rect = calculate_fitness(pulse_rect.to_iq()[0], pulse_rect.to_iq()[1], pulse_rect.t)
+        # for reference
+        sr_ref = calc_pulse_rect(pulse_rect.t[-1], 0)
+
+
+
+
+        ##########
+        ## Compensated and rect pulses for different couplings
+        ##########
+        self.plot_comp_pulses_gcoll()
+
+        #####
+        ## 2d for rect pulse
+        #####
+        #plot_rabi_2d_t_a(0, 200e-3, 10e3, 50e3, n_t=50, n_a=5)
+
+        plt.show()
+        exit()
+
+
+    def plot_comp_pulses_gcoll(self):
+        # matlab optimized (compensated pulse)
+        path = 'C:\\Users\\timo.joas\\OneDrive\\_Promotion\\Software\\Easyspin CompensatedPulse\\output'
+        file = '180612_compensated_pi_200ns_downsampled400.mat'
+        pulse_raw = scipy.io.loadmat(path + '\\' + file)
+        t = pulse_raw['t_comp_in']
+        y_complex = pulse_raw['y_comp_in']
+
+        w_rabi = np.pi / t[0][-1]
+        kappa_p = 500  # factor vacuum Rabi freq -> cavity Rabi freq
+
+        # create comp pulse
+        pulse_comp = AmpPhasePulse()
+        pulse_comp.set_t_axis(t[0, :])
+        pulse_comp.amps_c = y_complex[0, :]
+        # convert to rabi freq in w units
+        pulse_comp.amps_c = 2*np.pi*  np.real(pulse_comp.amps_c) + np.imag(pulse_comp.amps_c)
+        pulse_comp.amps_c *= kappa_p
+
+        # create rect pulse
+        pulse_rect = AmpPhasePulse()
+        pulse_rect.set_t_axis(t[0, :])
+
+        pulse_rect.amps_c = np.ones(len(pulse_rect.t)) * w_rabi
+        pulse_rect.amps_c *= kappa_p
+
+        plot_pulse_t_g(pulse_rect, 1e-2 * 10.7 * np.pi, 5e-2* 10.7 * np.pi, 5)
+        plot_pulse_t_g(pulse_comp, 1e-2 * 10.7 * np.pi, 5e-2* 10.7 * np.pi, 5)
+
+
+
+    def main(self):
+
+        pulse = FourierPulse(self.wgrund, self.number_fcp, self.max_ampl)
+        pulse_new = FourierPulse(self.wgrund, self.number_fcp, self.max_ampl)
+
+        pulse.init_random()
+
+        energy = calculate_fitness(pulse.get_amp_t_i(self.tp), pulse.get_amp_t_i(self.tp), self.tp)
+
+        fig, ax = plt.subplots(1, 1)
+
+        # debug plot_pulse_interactive
+        # for f in range(5):
+        #    self.plot_pulse_interactive(ax, self.tp, np.random.random(size=len(self.tp)))
+        #    time.sleep(1)
+        energy_best = 1
+        pulse_fcomps_best = None
+
+        while self.temp > 0:
+            for i in range(self.number_tries):
+
+                f_comps_new = pulse.f_comps + self.stepsize * np.random.uniform(-1, 1, (self.number_fcp, 2))
+                f_comps_new = pulse.clip_amps(f_comps_new)
+
+                pulse_new.f_comps = f_comps_new
+
+                energynew = calculate_fitness(pulse_new.get_amp_t_i(self.tp), pulse_new.get_amp_t_i(self.tp), self.tp)
+
+                if energynew < energy:
+                    pulse.f_comps = f_comps_new
+                    energy = energynew
+                    if energy < energy_best:
+                        energy_best = energy
+                        pulse_fcomps_best = pulse.f_comps
+                        print('New best pulse, inversion %f. fcomps %s ' % (-energy_best, pulse_fcomps_best))
+                else:
+                    # accept pulse with certain probabilty, even if not better
+                    # see scipy.optimize.basinhopping
+                    prop = min(1, np.exp(-(energynew - energy) / self.temp))
+                    if np.random.uniform() < prop:
+                        pulse.f_comps = f_comps_new
+                        energy = energynew
+
+                accepted = (energy == energynew)
+                print("Temp: %.3f, Inversion: %f, Step: %d, accepted: %s" % (self.temp, -energy, i, accepted))
+
+                # construct pulse in t domain
+                pulse_i, pulse_q = pulse.pulse_t_from_f(self.tp)
+
+                self.plot_pulse_interactive(ax, self.tp, [pulse_i, pulse_q])
+
+            self.temp *= self.dT
+        return pulse
+
+
+
+
+path_out = init_output_dir()
 param = InputParams()
 init()
-plot_rabi(0)
-plt.show()
-exit()
+
+
+#plot_rabi(0, 10e-3, param.pumptime*2)
+#plot_rabi_2d_t_q(20, 10e-3, param.pumptime/2, 10, 50, n_t=100, n_q=15)
+
 metropo = SimulatedAnnealing(param.pumptime, param.numsteps)
-res = metropo.main()
+
+metropo.main_play()
+
+#res = metropo.main()
+
+plt.show()
+
 
 
 
