@@ -69,13 +69,13 @@ class InputParams:
         # detuning drive to cavity wc-wp
         self.deltac = 0* 2*np.pi
         # transverse spin relaxation rate
-        self.gperp = 1e-9*  2*np.pi*0.09 #HWHM
+        self.gperp =  2*np.pi*0.09 #HWHM
         # longitudinal spin relaxation rate
-        self.gpar = 1e-9*   2*np.pi*.001#0.001 #HWHM
+        self.gpar =  2*np.pi*.001#0.001 #HWHM
         # q of spin pdf, q-Gaussian (see tsallis)
         self.q = 1.39
         # width of spin pdf, q-Gaussian
-        self.gammaq = 1e-9* 2*np.pi*9.4 #FWHM
+        self.gammaq = 1e-1*2*np.pi*9.4 #FWHM in units of [w]
         # bins in spin pdf
         self.nbins = 701#701#5000#20
         #g0 = self.gcoll/sqrt(nspins)
@@ -87,12 +87,14 @@ class InputParams:
 
         self.holes = False
         self.sim_inhom = True
+        self.hyperfine = False
 
         # todo: think of better OO structure
         # stuff that gets initialized
         self.spins = None
         self.gs = None
         self.pdf = None
+
 
     def init(self):
         # stuff that is calculated from input params
@@ -105,7 +107,7 @@ class InputParams:
         filename = 'mbeSim_params.json'
         filename = Tk_file._addTimestamp(filename)
         Tk_file.saveToFile(self, path_out + '\\' + filename, 'json')
-        # plot_spin_pdf(param)
+        #plot_spin_pdf(param)
 
 
 def init_output_dir():
@@ -206,11 +208,72 @@ def cauchy(x, pos, fwhm, ampl):
 
 
 def init_spin_pdf():
+    # from _create_pdf.ipnyb
+    # delta: ws- wc
+
+
+    holes = param.holes
+    inhomo = param.sim_inhom
+    if inhomo:
+        logger.warning("This seems buggy! Consider disabling inhomogenous broadening...")
+    hyperfine = param.hyperfine
+
+    delta = param.delta
+    hfcoupl = 2.3
+
+    f = np.linspace(-param.gammaq/2, param.gammaq/2, param.nbins)
+    if hyperfine:
+        param.pdf = tsallis(f, param.q, param.gammaq / 2 / np.pi) + tsallis(f - hfcoupl, param.param.q,
+                                                                            param.gammaq / 2 / np.pi) + tsallis(
+            f + hfcoupl, param.q,
+            param.gammaq / 2 / np.pi)
+    else:
+        param.pdf = tsallis(f, param.q, param.gammaq / 2 / np.pi)
+
+    if holes:
+        frequency_exclude = param.gcoll/2/np.pi
+        exclude_width = 0.2  # FWHM
+
+        indf = find_nearest(f, frequency_exclude)
+        scale = param.pdf[indf]
+
+        toex = cauchy(f, frequency_exclude, exclude_width, -scale) + cauchy(f, -frequency_exclude, exclude_width,
+                                                                            -scale)
+        # toex2 = cauchy(f, 0, exclude_width, -pdf[int(len(f)/2)])
+        param.pdf = param.pdf + toex
+
+    param.pdf = np.clip(param.pdf, 0, max(param.pdf))
+
+    spdf = sum(param.pdf)
+    param.pdf = param.pdf/spdf
+
+    f += delta / 2 / np.pi
+
+    if not inhomo:
+        param.pdf = np.zeros(np.shape(param.pdf))
+        param.pdf[int(param.nbins / 2)] = 1
+
+    param.spins = f #draw samples according to distribution
+    param.gs = np.sqrt(param.pdf)*param.gcoll       # single g
+    logger.warning("Using new gs")
+
+    #param.gs = np.ones(param.nbins) * 1./np.sqrt(len(param.pdf))*param.gcoll
+
+    #plt.figure()
+    #plt.plot(f, param.gs)
+    #plt.plot(f, param.pdf)
+
+
+    logger.info("Setting spin couplings for pdf. g_coll: {:.2f} MHz, Max. g_single: {:.2f} MHz".format(param.gcoll, np.max(param.gs)))
+
+
+
+def init_spin_pdf_BUGGY():
 
     # todo: what about HFS? -> see '_create_pdf.ipynb'
 
     holes = param.holes #set to true if you want to include holes in your simulation
-    inhomo = param.sim_inhom #do you want inhomogneous broadening
+    inhomo = False #param.sim_inhom #do you want inhomogneous broadening
 
     f = np.linspace(-param.gammaq/2, param.gammaq/2, param.nbins)
     param.pdf = tsallis(f, param.q, param.gammaq/2/np.pi)
@@ -248,10 +311,14 @@ def plot_spin_pdf(param_in):
 
     plt.plot(f, param_in.pdf)
 
-    plt.xlabel('f (MHz)')   # todo: really freq or w units?
+    plt.xlabel('f (MHz) [w]')
     plt.ylabel(r'$p$')
     plt.title(r'Spin pdf (Q-Gaussian)')
 
+def plot_cavity_shape(param_in):
+    pass
+    # todo: plot cavity shapre vs spin_pdf
+    # weird: q factor has no real effect
 
 def func(a, eta, deltdrive):
     spins2 = 2*np.pi*(param.spins)+deltdrive
@@ -343,7 +410,7 @@ def do_calculation(drive, tlistpump, tlistafter, init):
     asoldecay = odeintz(mbes, init2, tlistafter, args=(0,))
     
     # this is necessary because we are clustering the spins
-    # weighting the spins accrording to pdf (?)
+    # weighting the spins accrording to pdf
     asolpump[:,2::2] = asolpump[:,2::2]*param.pdf
     asolpump[:,1::2] = asolpump[:,1::2]*param.pdf
     asoldecay[:,2::2] = asoldecay[:,2::2]*param.pdf
@@ -457,6 +524,25 @@ def calc_pulse_rect(t_pump, p_in):
 
     return np.real(np.sum(asolpump[:, 2::2], axis=1))[-1]       # final s_z
 
+def calc_pulse_rect_cont(t_list_us, p_in):
+    """
+    Calc s_z after rectangular pulse
+    :param t_pump:
+    :param p_in:
+    :return:
+    """
+    a_in = p_dbm_to_wrabi(p_in)
+
+    init = np.ones(param.nbins*2+1)*(-1)
+    init[0] = 0
+    init[1::2] = 0
+
+    tlist_decay = np.arange(0, 1, 1)  # dummy decay
+
+    asolpump, asoldecay, infodict = do_calculation(a_in, t_list_us, tlist_decay, init)
+
+    return np.real(np.sum(asolpump[:, 2::2], axis=1))[:]       # s_z(t)
+
 
 def plot_rabi(p_in, t_start_us, t_end_us, n_t=100):
     # to validate pumptime
@@ -498,6 +584,7 @@ def plot_rabi_2d_t_q(p_in, t_start_us, t_end_us, q_start, q_end, n_t=100, n_q=15
 def plot_rabi_2d_t_a(t_start_us, t_end_us, a_start, a_end, q=250, n_t=100, n_a=15):
     # to validate pumptime
     # vary pumptime and look at sig_z. should see rabis.
+    # note: prefer plot_rabi_2d_t_a_2
 
     t_pulse_list = np.linspace(t_start_us, t_end_us, n_t)
     a_list = np.linspace(a_start, a_end, n_a)
@@ -515,6 +602,78 @@ def plot_rabi_2d_t_a(t_start_us, t_end_us, a_start, a_end, q=250, n_t=100, n_a=1
     plt.ylabel(r'$a$')
     plt.pcolor(1000*t_pulse_list, a_list, np.transpose(sz_final))#, vmin=-1, vmax=1)
     plt.colorbar()
+
+def plot_rabi_2d_t_a_2(t_end_us, a_start, a_end, q=250, n_t=100, n_a=15):
+    # to validate pumptime
+    # vary pumptime and look at sig_z. should see rabis.
+    # note: could directly take result of ode (instead looping t)
+
+    t_pulse_list = np.linspace(0, t_end_us, n_t)
+    a_list = np.linspace(a_start, a_end, n_a)
+    param.quali = q
+    param.init()
+    sz_final = np.zeros([n_t, n_a])
+
+    for j, a in enumerate(a_list):
+        p_in = p_wrabi_to_dbm(a)
+        sz_final[:,j] = calc_pulse_rect_cont(t_pulse_list, p_in)
+
+    plt.figure()
+    plt.xlabel('Pulse time (ns) @ Q={} dB'.format(q))
+    plt.ylabel(r'$a$')
+    plt.pcolor(1000*t_pulse_list, a_list, np.transpose(sz_final))#, vmin=-1, vmax=1)
+    plt.colorbar()
+
+def plot_rabi_2d_t_pdf_gammaq(t_end_us, gammaq_start, gammaq_end, p_in=10, q=250, n_t=100, n_gammaq=15):
+    # to validate pumptime
+    # vary pumptime and look at sig_z. should see rabis.
+    # note: could directly take result of ode (instead looping t)
+
+    t_pulse_list = np.linspace(0, t_end_us, n_t)
+    gamma_list = np.linspace(gammaq_start, gammaq_end, n_gammaq)
+    param.quali = q
+    param.init()
+    sz_final = np.zeros([n_t, n_gammaq])
+
+    for j, gamma in enumerate(gamma_list):
+        param.gammaq = gamma
+        param.init()
+        sz_final[:,j] = calc_pulse_rect_cont(t_pulse_list, p_in)
+
+    plt.figure()
+    plt.xlabel('Pulse time (ns) @ p={} dB, Q={}'.format(p_in, q))
+    plt.ylabel(r'$gamma_q$')
+    plt.pcolor(1000*t_pulse_list, gamma_list, np.transpose(sz_final), vmin=-1, vmax=1)
+    plt.colorbar()
+
+def plot_rabi_pdf_gammaq(t_end_us, gammaq_start, gammaq_end, p_in=10, q=250, n_t=100, n_gammaq=15):
+    # to validate pumptime
+    # vary pumptime and look at sig_z. should see rabis.
+    # note: could directly take result of ode (instead looping t)
+
+    t_pulse_list = np.linspace(0, t_end_us, n_t)
+    gamma_list = np.linspace(gammaq_start, gammaq_end, n_gammaq)
+    param.quali = q
+    param.init()
+    sz_final = np.zeros([n_t, n_gammaq])
+
+    fig, ax1 = plt.subplots(1, 1)
+
+    for j, gamma in enumerate(gamma_list):
+        param.gammaq = gamma
+        param.init()
+        sz_final[:,j] = calc_pulse_rect_cont(t_pulse_list, p_in)
+
+        leave_out_factor = np.ceil(len(gamma_list) / 10.0)
+        if j % leave_out_factor != 0:
+            continue
+        ax1.plot(1000 * t_pulse_list, sz_final[:,j], label=r'$gamma_q$={:.2f} MHz'.format(gamma))
+
+    # cav field
+    ax1.set_xlabel('Time (ns)')
+    ax1.set_title(r'Spin population $\sigma_z$')
+    ax1.set_ylabel('$\sigma_z$')
+    ax1.legend()
 
 
 def plot_pulse_t_g(pulse, g_coll_start, gcoll_end, n_q=15):
@@ -838,8 +997,9 @@ class SimulatedAnnealing:
         t = pulse_raw['t_comp_in']
         y_complex = pulse_raw['y_comp_in']
 
-        w_rabi = np.pi / t[0][-1]
-        kappa_p = 500 # factor vacuum Rabi freq -> cavity Rabi freq
+        w_rabi = np.pi / t[0][-1]   # rabi freq (single spin)
+        n_spins = param.nbins
+        kappa_p = np.sqrt(n_spins) * 500 # factor vacuum Rabi freq -> cavity Rabi freq
 
         # create comp pulse
         pulse_comp = AmpPhasePulse()
@@ -871,12 +1031,22 @@ class SimulatedAnnealing:
         ##########
         ## Compensated and rect pulses for different couplings
         ##########
-        self.plot_comp_pulses_gcoll()
+        # warning: doesn't use pulses above
+        #self.plot_comp_pulses_gcoll()
 
         #####
         ## 2d for rect pulse
         #####
         #plot_rabi_2d_t_a(0, 200e-3, 10e3, 50e3, n_t=50, n_a=5)
+        #plot_rabi_2d_t_a_2(200e-3, 10e3, 50e3, n_t=50, n_a=5)
+        p_in = 33 #33
+        plot_rabi_2d_t_pdf_gammaq(200e-3, 1e-2* 2*np.pi* 20, np.pi* 20, p_in=p_in)
+
+        ######
+        ## multiple 1d for rect pulse
+        #####
+        plot_rabi_pdf_gammaq(200e-3, 1e-2* 2*np.pi* 20, np.pi* 20, p_in=p_in)
+
 
         plt.show()
         exit()
@@ -890,8 +1060,9 @@ class SimulatedAnnealing:
         t = pulse_raw['t_comp_in']
         y_complex = pulse_raw['y_comp_in']
 
-        w_rabi = np.pi / t[0][-1]
-        kappa_p = 500  # factor vacuum Rabi freq -> cavity Rabi freq
+        w_rabi = np.pi / t[0][-1]  # rabi freq (single spin)
+        n_spins = param.nbins
+        kappa_p = np.sqrt(n_spins) * 50  # factor vacuum Rabi freq -> cavity Rabi freq
 
         # create comp pulse
         pulse_comp = AmpPhasePulse()
